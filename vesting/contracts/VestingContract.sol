@@ -1,61 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-library SafeMath {
-    function add(uint256 a, uint256 b) internal pure returns (uint256) {
-        uint256 c = a + b;
-        require(c >= a, "SafeMath: addition overflow");
-
-        return c;
-    }
-
-    function sub(uint256 a, uint256 b) internal pure returns (uint256) {
-        return sub(a, b, "SafeMath: subtraction overflow");
-    }
-
-    function sub(
-        uint256 a,
-        uint256 b,
-        string memory errorMessage
-    ) internal pure returns (uint256) {
-        require(b <= a, errorMessage);
-        uint256 c = a - b;
-
-        return c;
-    }
-
-    function mul(uint256 a, uint256 b) internal pure returns (uint256) {
-        if (a == 0) {
-            return 0;
-        }
-
-        uint256 c = a * b;
-        require(c / a == b, "SafeMath: multiplication overflow");
-
-        return c;
-    }
-
-    function div(uint256 a, uint256 b) internal pure returns (uint256) {
-        return div(a, b, "SafeMath: division by zero");
-    }
-
-    function div(
-        uint256 a,
-        uint256 b,
-        string memory errorMessage
-    ) internal pure returns (uint256) {
-        require(b > 0, errorMessage);
-        uint256 c = a / b;
-
-        return c;
-    }
-}
-
 interface IERC20 {
-    function transfer(
-        address recipient,
-        uint256 amount
-    ) external returns (bool);
+    function transfer(address recipient, uint256 amount)
+        external
+        returns (bool);
 
     function transferFrom(
         address sender,
@@ -67,8 +16,6 @@ interface IERC20 {
 }
 
 contract VestingContract {
-    using SafeMath for uint256;
-
     IERC20 public token;
     address public owner;
 
@@ -87,14 +34,30 @@ contract VestingContract {
         VestingPeriod period;
     }
 
-    address[] public beneficiaries;
+    struct BeneficiaryData {
+        VestingSchedule[] schedules;
+        bool isAdded;
+    }
 
-    mapping(address => VestingSchedule[]) public schedules;
+    address[] public beneficiaries;
     mapping(address => bool) public isBlackListed;
+    mapping(address => BeneficiaryData) public schedules;
 
     event AddedBlackList(address indexed _user);
     event RemovedBlackList(address indexed _user);
-
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+    event VestingScheduleCreated(
+        address indexed beneficiary,
+        uint256 amount,
+        uint256 startTime,
+        uint256 endTime,
+        VestingPeriod period
+    );
+    event TokensClaimed(address indexed beneficiary, uint256 amount);
+    
     constructor(address tokenAddress) {
         token = IERC20(tokenAddress);
         owner = msg.sender;
@@ -106,6 +69,8 @@ contract VestingContract {
     }
 
     function transferOwnership(address _owner) public onlyOwner {
+        require(_owner != address(0), "New owner is the zero address");
+        emit OwnershipTransferred(owner, _owner);
         owner = _owner;
     }
 
@@ -119,16 +84,13 @@ contract VestingContract {
         emit RemovedBlackList(_clearedUser);
     }
 
-    function batchAddBlacklist(
-        address[] memory _beneficiaries
-    ) public onlyOwner {
+    function batchAddBlacklist(address[] memory _beneficiaries)
+        public
+        onlyOwner
+    {
         for (uint256 i = 0; i < _beneficiaries.length; i++) {
             addBlackList(_beneficiaries[i]);
         }
-    }
-
-    function setTokenAddress(address _tokenAddress) public onlyOwner {
-        token = IERC20(_tokenAddress);
     }
 
     function createVestingSchedule(
@@ -138,11 +100,36 @@ contract VestingContract {
         uint256 endTime,
         VestingPeriod period
     ) public onlyOwner {
+        require(
+            endTime > startTime,
+            "End time should be greater than start time!"
+        );
+        uint256 vestingDuration = endTime - startTime;
+        uint256 vestingPeriodUnit;
+        if (period == VestingPeriod.WEEKLY) {
+            vestingPeriodUnit = 1 weeks;
+        } else if (period == VestingPeriod.MONTHLY) {
+            vestingPeriodUnit = 30 days;
+        } else {
+            vestingPeriodUnit = vestingDuration;
+        }
+        require(
+            (vestingDuration / vestingPeriodUnit) > 0,
+            "Vesting duration is too short for the selected VestingPeriod"
+        );
+
         if (isBlackListed[beneficiary]) {
             return;
         }
-        //require(token.transferFrom(msg.sender, address(this), amount), "Transfer failed");
-        beneficiaries.push(beneficiary);
+        require(
+            token.transferFrom(msg.sender, address(this), amount),
+            "Transfer failed"
+        );
+
+        if (!schedules[beneficiary].isAdded) {
+            beneficiaries.push(beneficiary);
+            schedules[beneficiary].isAdded = true;
+        }
 
         VestingSchedule memory newSchedule = VestingSchedule({
             beneficiary: beneficiary,
@@ -153,7 +140,15 @@ contract VestingContract {
             period: period
         });
 
-        schedules[beneficiary].push(newSchedule);
+        schedules[beneficiary].schedules.push(newSchedule);
+
+        emit VestingScheduleCreated(
+            beneficiary,
+            amount,
+            startTime,
+            endTime,
+            period
+        );
     }
 
     function batchCreateVestingSchedule(
@@ -161,33 +156,34 @@ contract VestingContract {
         uint256[] memory amounts,
         uint256[] memory startTimes,
         uint256[] memory endTimes,
-        VestingPeriod[] memory periods,
-        uint256 batchSize
+        VestingPeriod[] memory periods
     ) public onlyOwner {
-        for (uint256 i = 0; i < batchSize; i++) {
-            address beneficiary = _beneficiaries[i];
-            uint256 amount = amounts[i];
-            uint256 startTime = startTimes[i];
-            uint256 endTime = endTimes[i];
-            VestingPeriod period = periods[i];
+        require(
+            _beneficiaries.length == amounts.length &&
+                amounts.length == startTimes.length &&
+                startTimes.length == endTimes.length &&
+                endTimes.length == periods.length,
+            "Input arrays must have the same length"
+        );
+        for (uint256 i = 0; i < _beneficiaries.length; i++) {
             createVestingSchedule(
-                beneficiary,
-                amount,
-                startTime,
-                endTime,
-                period
+                _beneficiaries[i],
+                amounts[i],
+                startTimes[i],
+                endTimes[i],
+                periods[i]
             );
         }
     }
 
     function claim() public {
-        if (isBlackListed[msg.sender]) {
-            return;
-        }
-        VestingSchedule[] storage beneficiarySchedules = schedules[msg.sender];
+        require(!isBlackListed[msg.sender], "You are blacklisted!");
 
-        for (uint256 i = 0; i < beneficiarySchedules.length; i++) {
-            VestingSchedule storage schedule = beneficiarySchedules[i];
+        BeneficiaryData storage beneficiaryData = schedules[msg.sender];
+        uint256 totalClaimed = 0;
+
+        for (uint256 i = 0; i < beneficiaryData.schedules.length; i++) {
+            VestingSchedule storage schedule = beneficiaryData.schedules[i];
 
             if (
                 block.timestamp < schedule.startTime ||
@@ -221,20 +217,19 @@ contract VestingContract {
 
             uint256 payout = claimableAmount - schedule.claimedAmount;
             schedule.claimedAmount = claimableAmount;
-
-            require(token.transfer(msg.sender, payout), "Transfer failed");
+            totalClaimed += payout;
         }
+
+        require(token.transfer(msg.sender, totalClaimed), "Transfer failed");
+        emit TokensClaimed(msg.sender, totalClaimed);
     }
 
-    function withdraw() public onlyOwner {
-        uint256 balance = token.balanceOf(address(this));
-        require(token.transfer(owner, balance), "Transfer failed");
-    }
-
-    function getVestingSchedule(
-        address _beneficiary
-    ) public view returns (VestingSchedule[] memory) {
-        return schedules[_beneficiary];
+    function getVestingSchedule(address _beneficiary)
+        public
+        view
+        returns (VestingSchedule[] memory)
+    {
+        return schedules[_beneficiary].schedules;
     }
 
     function getAllVestingSchedules()
@@ -246,8 +241,7 @@ contract VestingContract {
             beneficiaries.length
         );
         for (uint256 i = 0; i < beneficiaries.length; i++) {
-            address _beneficiary = beneficiaries[i];
-            allSchedules[i] = getVestingSchedule(_beneficiary);
+            allSchedules[i] = getVestingSchedule(beneficiaries[i]);
         }
         return allSchedules;
     }
